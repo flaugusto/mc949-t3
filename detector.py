@@ -16,7 +16,7 @@ tts.setProperty('rate', 160)  # Ajuste da velocidade da fala
 detector = YOLO("yolov8n.pt")  # YOLOv8 Nano (leve e rápido)
 
 # Abertura de vídeo (usando um arquivo de teste ou webcam)
-cap = cv2.VideoCapture('video.mp4')  # Use '0' para webcam ou 'videos/teste.mp4' para um arquivo de vídeo
+cap = cv2.VideoCapture('video.mp4')  # Use '0' para webcam ou 'video.mp4' para um arquivo de vídeo
 
 # Configuração da fala
 detected_objects = []  # Armazena os objetos que já foram narrados para evitar repetições

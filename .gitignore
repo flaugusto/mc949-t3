@@ -1,0 +1,22 @@
+# Ignore Python cache and virtual envs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore logs and temporary data
+*.log
+*.tmp
+
+# Ignore IDE settings
+.vscode/
+.idea/
+
+yolov8n.pt
