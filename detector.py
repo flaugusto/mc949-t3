@@ -22,46 +22,53 @@ transform = midas_transforms.small_transform
 DETECT_CONF = 0.25
 DETECT_IOU = 0.45
 DETECT_IMGSZ = 640
+SAVE_OUTPUT = True
+# Arquivos de saída: RAW (sem áudio) e FINAL (com áudio muxado)
+RAW_OUTPUT_PATH = 'output_raw.mp4'
+FINAL_OUTPUT_PATH = 'output.mp4'
+OUTPUT_FPS = 12.0
+SAVE_AUDIO = True
+MUX_AUDIO_TO_VIDEO = True
+AUDIO_DIR = 'tts_audio'
+# Salvar vídeo lado-a-lado (Detecção | Depth)
+SAVE_SIDEBYSIDE = True
 
-# Classes-alvo (COCO → PT-BR)
+# Classes-alvo (COCO → PT-BR) — manter apenas: bicicleta, moto, banco, pilastra, hidrante
 TARGET_CLASS_MAP = {
-    "person": "pessoa",
     "bicycle": "bicicleta",
     "motorbike": "moto",
-    "car": "carro",
-    "bus": "ônibus",
-    "truck": "caminhão",
+    "motorcycle": "moto",  # nome usado em alguns modelos COCO
     "bench": "banco",
-    # Pseudo-classe mantida
+    "fire hydrant": "hidrante",
+    # Pseudo-classe mantida (via profundidade)
     "pillar": "pilastra",
 }
 
 CLASS_WEIGHTS = {
-    "person": 1.0,
-    "bicycle": 1.0,
-    "motorbike": 1.0,
-    "car": 1.0,
-    "bus": 1.0,
-    "truck": 1.0,
-    "bench": 0.4,
-    "pillar": 0.9,
+    # Ordem de prioridade: pilastra > moto > bicicleta > banco > hidrante
+    "pillar": 1.0,
+    "motorbike": 0.95,
+    "motorcycle": 0.95,
+    "bicycle": 0.9,
+    "bench": 0.5,
+    "fire hydrant": 0.45,
 }
 
 # Confiabilidades mínimas e restrições por classe
 MIN_CONF_PER_CLASS = {
-    "person": 0.60,
-    "bicycle": 0.35,
-    "motorbike": 0.55,
-    "car": 0.35,
-    "bus": 0.35,
-    "truck": 0.35,
+    "bicycle": 0.40,
+    "motorbike": 0.40,
+    "motorcycle": 0.40,
     "bench": 0.35,
+    "fire hydrant": 0.45,
 }
-MIN_AREA_FRAC = 0.002  # área mínima relativa do bbox
-PERSON_MIN_AR = 1.2     # razão altura/largura mínima para pessoa
+MIN_AREA_FRAC = 0.002  # área mínima relativa genérica do bbox
 MOTORBIKE_MIN_AREA_FRAC = 0.004
 MOTORBIKE_MIN_AR = 0.6
 MOTORBIKE_MAX_AR = 2.5
+BICYCLE_MIN_AREA_FRAC = 0.003
+BENCH_MIN_AREA_FRAC = 0.004
+HYDRANT_MIN_AREA_FRAC = 0.0015
 
 # ROI e zona de perigo (frações do frame)
 ROI_X = (0.30, 0.70)
@@ -152,11 +159,8 @@ def filter_relevant(detections):
         x1, y1, x2, y2 = d["bbox"]
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
-        if cls_en == "person":
-            ar = h / float(w)
-            if ar < PERSON_MIN_AR:
-                continue
-        if cls_en == "motorbike":
+        # Moto (motorbike/motorcycle): razão de aspecto razoável
+        if cls_en in ("motorbike", "motorcycle"):
             ar = h / float(w)
             if not (MOTORBIKE_MIN_AR <= ar <= MOTORBIKE_MAX_AR):
                 continue
@@ -284,7 +288,13 @@ def select_primary(dets, frame, depth, min_d, max_d):
             continue
         area_norm = area / float(w * h)
         # área mínima específica por classe
-        if d["cls_en"] == "motorbike" and area_norm < MOTORBIKE_MIN_AREA_FRAC:
+        if d["cls_en"] in ("motorbike", "motorcycle") and area_norm < MOTORBIKE_MIN_AREA_FRAC:
+            continue
+        if d["cls_en"] == "bicycle" and area_norm < BICYCLE_MIN_AREA_FRAC:
+            continue
+        if d["cls_en"] == "bench" and area_norm < BENCH_MIN_AREA_FRAC:
+            continue
+        if d["cls_en"] == "fire hydrant" and area_norm < HYDRANT_MIN_AREA_FRAC:
             continue
         roi_bonus = 1.0 if in_region(cx, cy, w, h, ROI_X, ROI_Y) else 0.0
         score = 0.5 * prox_smooth + 0.25 * area_norm + 0.15 * roi_bonus + 0.10 * class_weight(d["cls_en"])
@@ -369,6 +379,42 @@ def draw_overlay(frame, depth_vis, target, fps, action, latency_ms):
     cv2.imshow("Detection", vis)
     cv2.imshow("Depth", depth_vis)
 
+def queue_tts_audio(text, start_ms):
+    if not SAVE_AUDIO:
+        return
+    try:
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+        idx = len(tts_events) + 1
+        wav_path = os.path.join(AUDIO_DIR, f"msg_{idx:04d}.wav")
+        p = subprocess.Popen(["espeak-ng", "-v", "pt-br", "-s", "170", "-w", wav_path, text])
+        tts_procs.append(p)
+        tts_events.append((wav_path, int(start_ms)))
+    except Exception:
+        pass
+
+def finalize_audio_mux():
+    for p in tts_procs:
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+    if not (SAVE_AUDIO and MUX_AUDIO_TO_VIDEO and tts_events and os.path.exists(RAW_OUTPUT_PATH)):
+        return
+    cmd = ["ffmpeg", "-y", "-i", RAW_OUTPUT_PATH]
+    for (wav_path, _) in tts_events:
+        cmd += ["-i", wav_path]
+    filter_parts = []
+    mix_inputs = []
+    for i, (_, start_ms) in enumerate(tts_events, start=1):
+        filter_parts.append(f"[{i}:a]adelay={start_ms}|{start_ms}[a{i}]")
+        mix_inputs.append(f"[a{i}]")
+    filter_complex = ";".join(filter_parts) + ";" + "".join(mix_inputs) + f"amix=inputs={len(tts_events)}:normalize=0[aout]"
+    cmd += ["-filter_complex", filter_complex, "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest", FINAL_OUTPUT_PATH]
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception:
+        pass
+
 # ------------ Vídeo ------------
 cap = cv2.VideoCapture('video.mp4')
 
@@ -378,12 +424,31 @@ cached_depth = None
 cached_depth_vis = None
 cached_min_d = None
 cached_max_d = None
+writer = None
+writer_size = None
+writer_fps = OUTPUT_FPS
+frames_written = 0
+video_fps = cap.get(cv2.CAP_PROP_FPS)
+if not video_fps or video_fps <= 0:
+    video_fps = 30.0
+tts_events = []
+tts_procs = []
 
 while cap.isOpened():
     loop_start = time.perf_counter()
     ret, frame = cap.read()
     if not ret:
         break
+
+    # Inicializa o gravador no primeiro frame
+    if SAVE_OUTPUT and writer is None:
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        if SAVE_SIDEBYSIDE:
+            writer_size = (w * 2, h)
+        else:
+            writer_size = (w, h)
+        writer = cv2.VideoWriter(RAW_OUTPUT_PATH, fourcc, writer_fps, writer_size)
 
     # Depth decimation
     if frame_idx % DEPTH_EVERY_N == 0 or cached_depth is None:
@@ -407,13 +472,19 @@ while cap.isOpened():
     now = time.perf_counter()
     if action and can_speak(now, "alert", action_text=action):
         latency_ms = (now - loop_start) * 1000.0
+        # timestamp para áudio alinhado ao vídeo gravado (writer_fps)
+        event_time_ms = (frames_written / writer_fps) * 1000.0
         speak(action)
+        queue_tts_audio(action, event_time_ms)
         mark_spoken(now, "alert", action_text=action)
         last_latency_ms = latency_ms
     elif primary is not None and can_speak(now, "class") and action is None:
         latency_ms = (now - loop_start) * 1000.0
         cls_pt = primary.get("cls_pt", TARGET_CLASS_MAP.get(primary["cls_en"], primary["cls_en"]))
-        speak(f"{cls_pt}, {primary['prox_label']}")
+        speech_text = f"{cls_pt}, {primary['prox_label']}"
+        event_time_ms = (frames_written / writer_fps) * 1000.0
+        speak(speech_text)
+        queue_tts_audio(speech_text, event_time_ms)
         mark_spoken(now, "class")
         last_latency_ms = latency_ms
 
@@ -424,10 +495,26 @@ while cap.isOpened():
 
     draw_overlay(frame, depth_vis, primary, fps, action, last_latency_ms)
 
+    # Salvar frame com overlay
+    if writer is not None:
+        if SAVE_SIDEBYSIDE:
+            h, w = frame.shape[:2]
+            depth_show = depth_vis
+            if depth_show.shape[0] != h or depth_show.shape[1] != w:
+                depth_show = cv2.resize(depth_show, (w, h))
+            out_frame = np.hstack([frame, depth_show])
+        else:
+            out_frame = frame
+        writer.write(out_frame)
+        frames_written += 1
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
     frame_idx += 1
 
 cap.release()
+if writer is not None:
+    writer.release()
+finalize_audio_mux()
 cv2.destroyAllWindows()
